@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         VRC-Video-Allowlist-QuickEdit
-// @namespace    鸭鸭
+// @namespace    https://github.com/mmyo456/VRC-Video-Allowlist-QuickEdit
+// @copyright    鸭鸭
 // @version      0.0.1
 // @description  用于快速批量编辑 VRChat 世界播放器域名白名单的Tampermonkey脚本
 // @icon         https://i.ouo.chat/favicon.ico
