@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VRC-Video-Allowlist-QuickEdit
 // @namespace    https://github.com/mmyo456/VRC-Video-Allowlist-QuickEdit
-// @author    鸭鸭
+// @author       鸭鸭
 // @version      0.0.1
 // @description  用于快速批量编辑 VRChat 世界播放器域名白名单的Tampermonkey脚本
 // @icon         https://i.ouo.chat/favicon.ico
@@ -134,17 +134,16 @@
   }
 
   /**
-   * 所有输入操作共用的数据管线：拆分 -> 规范化 -> 去重 -> 可选排序。
+   * 所有输入操作共用的数据管线：拆分 -> 规范化 -> 去重。
    * 每个域名只解析一次，避免输入提示、排序和保存各自实现一套规则。
    */
-  function analyzeInput(text, { sort = false } = {}) {
+  function analyzeInput(text) {
     const normalized = splitEntries(text).map(normalizeEntry);
     const unique = [...new Set(normalized)];
-    const values = sort ? sortDomains(unique) : unique;
 
     return {
-      values,
-      text: values.join('\n'),
+      values: unique,
+      text: unique.join('\n'),
       duplicateCount: normalized.length - unique.length,
     };
   }
@@ -604,7 +603,6 @@
     try {
       if (!worldId) throw new Error('当前网址中没有世界 ID');
 
-      // 保存时再次自动排序，确保即使没有点击“自动排序”，提交结果仍然有序。
       // 本地列表与最后载入的列表完全一致时立即停止。
       // 这一判断位于所有 API 调用之前，因此不会发送 GET 或 PUT 请求。
       const draftInput = analyzeInput(input.value);
@@ -614,9 +612,9 @@
         return;
       }
 
-      // 确认存在修改后才执行提交前的自动排序。
-      const entered = sortDomains(draftInput.values);
-      input.value = entered.join('\n');
+      // 保存严格保留当前排列顺序；只有点击“自动排序”才会调整顺序。
+      const entered = draftInput.values;
+      input.value = draftInput.text;
 
       // 即便文本框已经自动载入，提交时仍重新 GET 一次。
       // 这样可以降低页面停留较久后覆盖掉其他修改的风险。
@@ -629,7 +627,7 @@
       if (!isActiveSubmit(sequence, worldId)) return;
 
       const current = normalizeServerList(world.urlList);
-      // 文本框就是最终列表；analyzeInput 已经完成规范化、去重和排序。
+      // 文本框就是最终列表；analyzeInput 已经完成规范化和去重。
       // 文本框为空时 next 也是空数组，即清空服务器上的 urlList。
       const next = entered;
 
