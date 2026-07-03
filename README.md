@@ -21,7 +21,7 @@
 
 ### 2. 安装脚本
 
-[点击安装 VRC Video Allowlist QuickEdit](https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js)
+[点击安装 VRC Video Allowlist QuickEdit](https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js)
 
 如果浏览器没有自动打开安装页面，也可以下载
 `vrc-video-allowlist-quickEdit.user.js`，然后将其导入 Tampermonkey。
