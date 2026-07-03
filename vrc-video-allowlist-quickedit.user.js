@@ -2,14 +2,15 @@
 // @name         VRC-Video-Allowlist-QuickEdit
 // @namespace    https://github.com/mmyo456/VRC-Video-Allowlist-QuickEdit
 // @author       鸭鸭
-// @version      0.0.1
+// @version      0.0.2
 // @description  用于快速批量编辑 VRChat 世界播放器域名白名单的Tampermonkey脚本
 // @icon         https://i.ouo.chat/favicon.ico
+// @match        https://vrchat.com/home
 // @match        https://vrchat.com/home/*
 // @grant        none
 // @run-at       document-idle
-// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
-// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
+// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
+// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
 // ==/UserScript==
 
 (() => {
@@ -764,6 +765,18 @@
 
   window.addEventListener('popstate', syncPanelWithCurrentPage);
   window.addEventListener('vrc-url-list-route-change', syncPanelWithCurrentPage);
+
+  /**
+   * 兜底检测 URL 变化。
+   * 某些 SPA 路由器会在本脚本加载前保存原始 History 方法，导致上面的
+   * pushState/replaceState 包装捕获不到跳转。这里只比较 URL，不会定时请求 API。
+   */
+  let lastObservedUrl = location.href;
+  setInterval(() => {
+    if (location.href === lastObservedUrl) return;
+    lastObservedUrl = location.href;
+    syncPanelWithCurrentPage();
+  }, 300);
 
   // 处理脚本首次注入时所在的页面。
   syncPanelWithCurrentPage();
