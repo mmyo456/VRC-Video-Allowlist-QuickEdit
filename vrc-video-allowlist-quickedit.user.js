@@ -2,15 +2,14 @@
 // @name         VRC-Video-Allowlist-QuickEdit
 // @namespace    https://github.com/mmyo456/VRC-Video-Allowlist-QuickEdit
 // @author       鸭鸭
-// @version      0.0.2
+// @version      0.0.3
 // @description  用于快速批量编辑 VRChat 世界播放器域名白名单的Tampermonkey脚本
 // @icon         https://i.ouo.chat/favicon.ico
-// @match        https://vrchat.com/home
-// @match        https://vrchat.com/home/*
+// @match        https://vrchat.com/home*
 // @grant        none
 // @run-at       document-idle
-// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
-// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
+// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
+// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
 // ==/UserScript==
 
 (() => {
@@ -745,6 +744,30 @@
     }
   }
 
+  const ROUTE_EVENT = 'vrc-url-list-route-change';
+  let lastObservedUrl = '';
+  let routeSyncQueued = false;
+
+  /**
+   * 所有路由来源共用同一个入口，并按完整 URL 去重。
+   * pathname、查询参数或 hash 任一变化都会被识别，但同一次跳转只同步一次。
+   */
+  function syncRoute({ force = false } = {}) {
+    const currentUrl = location.href;
+    if (!force && currentUrl === lastObservedUrl) return;
+    lastObservedUrl = currentUrl;
+    syncPanelWithCurrentPage();
+  }
+
+  function queueRouteSync() {
+    if (routeSyncQueued) return;
+    routeSyncQueued = true;
+    queueMicrotask(() => {
+      routeSyncQueued = false;
+      syncRoute();
+    });
+  }
+
   /**
    * VRChat 使用 History API 完成站内跳转，普通的 popstate 只覆盖
    * 前进/后退，捕获不到代码主动调用 pushState/replaceState 的情况。
@@ -757,27 +780,30 @@
       const originalMethod = history[methodName];
       history[methodName] = function (...args) {
         const result = originalMethod.apply(this, args);
-        window.dispatchEvent(new Event('vrc-url-list-route-change'));
+        window.dispatchEvent(new Event(ROUTE_EVENT));
         return result;
       };
     }
   }
 
-  window.addEventListener('popstate', syncPanelWithCurrentPage);
-  window.addEventListener('vrc-url-list-route-change', syncPanelWithCurrentPage);
+  window.addEventListener('popstate', queueRouteSync);
+  window.addEventListener('hashchange', queueRouteSync);
+  window.addEventListener(ROUTE_EVENT, queueRouteSync);
+
+  // Chromium Navigation API 可更直接地捕获现代 SPA 跳转；不存在时自动跳过。
+  if (window.navigation) {
+    window.navigation.addEventListener('currententrychange', queueRouteSync);
+  }
 
   /**
    * 兜底检测 URL 变化。
    * 某些 SPA 路由器会在本脚本加载前保存原始 History 方法，导致上面的
    * pushState/replaceState 包装捕获不到跳转。这里只比较 URL，不会定时请求 API。
    */
-  let lastObservedUrl = location.href;
   setInterval(() => {
-    if (location.href === lastObservedUrl) return;
-    lastObservedUrl = location.href;
-    syncPanelWithCurrentPage();
-  }, 300);
+    syncRoute();
+  }, 500);
 
   // 处理脚本首次注入时所在的页面。
-  syncPanelWithCurrentPage();
+  syncRoute({ force: true });
 })();
