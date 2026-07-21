@@ -2,14 +2,15 @@
 // @name         VRC-Video-Allowlist-QuickEdit
 // @namespace    https://github.com/mmyo456/VRC-Video-Allowlist-QuickEdit
 // @author       鸭鸭
-// @version      0.0.3
-// @description  用于快速批量编辑 VRChat 世界播放器域名白名单的Tampermonkey脚本
+// @version      0.0.4
+// @description  用于快速批量编辑 VRChat 世界播放器域名白名单的 Tampermonkey 脚本
 // @icon         https://i.ouo.chat/favicon.ico
-// @match        https://vrchat.com/home*
+// @match        https://vrchat.com/home
+// @match        https://vrchat.com/home/*
 // @grant        none
 // @run-at       document-idle
-// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
-// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickEdit.user.js
+// @downloadURL  https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
+// @updateURL    https://raw.githubusercontent.com/mmyo456/VRC-Video-Allowlist-QuickEdit/main/vrc-video-allowlist-quickedit.user.js
 // ==/UserScript==
 
 (() => {
@@ -20,22 +21,40 @@
   // 此正则只负责从当前地址中取出 wrld_ 开头的世界 ID。
   const WORLD_ID_RE = /\/worlds\/(wrld_[0-9a-f-]+)\/edit/i;
 
-  // VRChat 网页保存世界资料时会把这些可编辑字段一起发送。
-  // 提交前先 GET 最新世界资料，再仅复制这些字段，可以避免把
-  // visits、favorites、authorId 等只读字段误发回服务器。
-  const EDITABLE_FIELDS = [
-    'capacity',
-    'description',
-    'name',
-    'previewYoutubeId',
-    'recommendedCapacity',
-    'releaseStatus',
-    'tags',
-    'urlList',
-    'disabledPropAbilities',
-  ];
+  const REQUEST_TIMEOUT_MS = 15_000;
+  const UNCERTAIN_WRITE_GUARD_MS = 30_000;
 
   const getWorldId = () => location.pathname.match(WORLD_ID_RE)?.[1] ?? null;
+
+  function inspectUncertainWrite(worldId, serverList) {
+    const pending = uncertainWrites.get(worldId);
+    if (!pending) return null;
+
+    if (listsEqual(serverList, pending.expected)) {
+      uncertainWrites.delete(worldId);
+
+      // 尝试保存的原草稿已经落库；若用户此后又编辑过，则保留那份新草稿。
+      const draft = draftsByWorld.get(worldId);
+      try {
+        if (draft !== undefined && listsEqual(analyzeInput(draft).values, pending.expected)) {
+          draftsByWorld.delete(worldId);
+        }
+      } catch {
+        // 无效草稿显然不是已经保存的目标值，应继续保留。
+      }
+      return { state: 'saved' };
+    }
+
+    if (Date.now() >= pending.releaseAfter) {
+      uncertainWrites.delete(worldId);
+      return { state: 'expired' };
+    }
+
+    return {
+      state: 'waiting',
+      seconds: Math.max(1, Math.ceil((pending.releaseAfter - Date.now()) / 1_000)),
+    };
+  }
 
   /**
    * 把用户输入转换成 VRChat urlList 所需的纯域名。
@@ -159,6 +178,13 @@
       ),
     ];
 
+  function getWorldList(world) {
+    if (!Array.isArray(world?.urlList)) {
+      throw new Error('服务器未返回有效的 urlList');
+    }
+    return normalizeServerList(world.urlList);
+  }
+
   const listsEqual = (left, right) =>
     left.length === right.length && left.every((item, index) => item === right[index]);
 
@@ -168,22 +194,62 @@
    * 脚本中不需要保存 Cookie、密码或 Token。
    */
   async function api(path, options = {}) {
-    const response = await fetch(path, {
-      credentials: 'include',
-      ...options,
-      headers: {
-        Accept: 'application/json',
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...options.headers,
-      },
-    });
+    const {
+      signal: externalSignal,
+      timeoutMs = REQUEST_TIMEOUT_MS,
+      ...fetchOptions
+    } = options;
+    const method = (fetchOptions.method || 'GET').toUpperCase();
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const abortFromExternal = () => controller.abort(externalSignal?.reason);
 
-    const body = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = body?.error?.message || body?.message || `${response.status} ${response.statusText}`;
-      throw new Error(message);
+    if (externalSignal?.aborted) abortFromExternal();
+    else externalSignal?.addEventListener('abort', abortFromExternal, { once: true });
+
+    let responseReceived = false;
+    try {
+      const response = await fetch(path, {
+        credentials: 'include',
+        ...(method === 'GET' ? { cache: 'no-store' } : {}),
+        ...fetchOptions,
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/json',
+          ...(fetchOptions.body ? { 'Content-Type': 'application/json' } : {}),
+          ...fetchOptions.headers,
+        },
+      });
+      responseReceived = true;
+
+      const body = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message = body?.error?.message || body?.message || `${response.status} ${response.statusText}`;
+        const responseError = new Error(message);
+        responseError.status = response.status;
+        throw responseError;
+      }
+      return body;
+    } catch (error) {
+      const requestError = timedOut ? new Error('请求超时，请稍后重试') : error;
+
+      // PUT 在收到响应前超时或断网时，无法判断请求是否已经抵达服务器。
+      // 给错误加标记，让保存逻辑延迟复核，而不是立刻允许第二次写入。
+      if (
+        method !== 'GET' &&
+        (timedOut || !responseReceived || (requestError.status >= 500 && requestError.status <= 599))
+      ) {
+        requestError.writeUncertain = true;
+      }
+      throw requestError;
+    } finally {
+      clearTimeout(timeoutId);
+      externalSignal?.removeEventListener('abort', abortFromExternal);
     }
-    return body;
   }
 
   // 创建悬浮面板。使用原生 DOM，不依赖 VRChat 网站自己的 React 组件。
@@ -280,7 +346,7 @@
         display: flex; align-items: baseline; justify-content: space-between;
         gap: 10px; margin-bottom: 6px; font-weight: 650;
       }
-      .vrc-ule-label span { color: #625c49; font-size: 11px; font-weight: 450; }
+      .vrc-ule-label span { color: #464234; font-size: 11px; font-weight: 450; }
       #vrc-ule-body textarea {
         display: block; width: 100%; min-height: 170px; padding: 10px 11px; resize: vertical;
         border: 1px solid #8f8566; border-radius: 9px;
@@ -288,7 +354,7 @@
         box-shadow: inset 0 1px 3px #5f57351c;
         font: 12.5px/1.55 ui-monospace, "Cascadia Code", Consolas, monospace;
       }
-      #vrc-ule-body textarea::placeholder { color: #89816a; }
+      #vrc-ule-body textarea::placeholder { color: #6d6653; }
       .vrc-ule-actions { display: flex; gap: 9px; margin-top: 11px; }
       .vrc-ule-actions button { flex: 1; }
       .vrc-ule-actions button { min-height: 38px; padding: 7px 11px; font-weight: 650; }
@@ -334,19 +400,27 @@
   const count = panel.querySelector('#vrc-ule-count');
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   let bodyAnimation = null;
+  let deferredDuplicateCount = 0;
+  let inputTouchedSinceLoad = false;
 
   // 当前读取请求的控制器。发起新读取或离开编辑页时会主动取消旧请求，
   // 避免无用网络传输，也避免旧世界的响应覆盖新世界的文本框。
   let loadController = null;
   let loadedWorldId = null;
   let loadedUrlList = [];
+  let hasLoadedList = false;
   let submitSequence = 0;
   let isSubmitting = false;
+  let pendingWrite = null;
+  const draftsByWorld = new Map();
+  const uncertainWrites = new Map();
 
   const isActiveSubmit = (sequence, worldId) =>
     sequence === submitSequence && worldId === getWorldId();
 
   function hasUnsavedChanges() {
+    if (!hasLoadedList) return input.value.trim() !== '';
+
     try {
       return !listsEqual(analyzeInput(input.value).values, loadedUrlList);
     } catch {
@@ -355,18 +429,49 @@
     }
   }
 
+  function saveDraftForLoadedWorld() {
+    if (!loadedWorldId) return;
+
+    // 服务器基线尚未读到时，不能仅凭当前内容为空就删除旧草稿；
+    // 若用户确实编辑过，则连空字符串也要保存，才能表达“清空列表”的意图。
+    if (!hasLoadedList) {
+      if (inputTouchedSinceLoad || input.value.trim()) {
+        draftsByWorld.set(loadedWorldId, input.value);
+      }
+      return;
+    }
+
+    if (hasUnsavedChanges()) draftsByWorld.set(loadedWorldId, input.value);
+    else draftsByWorld.delete(loadedWorldId);
+  }
+
+  function restoreDraft(worldId) {
+    const draft = draftsByWorld.get(worldId);
+    if (draft === undefined) return false;
+
+    input.value = draft;
+    inputTouchedSinceLoad = false;
+    try {
+      updateCountFor(analyzeInput(draft).values);
+    } catch {
+      setCount('待检查');
+    }
+    return true;
+  }
+
   // 统一维护控件状态，避免读取和提交的 finally 相互把按钮错误地重新启用。
   function updateControls() {
-    const busy = isSubmitting || loadController !== null;
+    const busy = isSubmitting || pendingWrite !== null || loadController !== null;
+    const mustVerifyWrite = uncertainWrites.has(getWorldId());
     input.disabled = busy;
-    submit.disabled = busy;
+    submit.disabled = busy || mustVerifyWrite;
     sortButton.disabled = busy;
-    loadButton.disabled = isSubmitting || loadController !== null;
+    loadButton.disabled = busy;
   }
 
   const setStatus = (message, isError = false) => {
     status.textContent = message;
-    status.style.color = isError ? '#8b1e1e' : '#365b3c';
+    status.style.color = isError ? '#8b1e1e' : '#294a30';
 
     // 重启 class 动画，使连续的状态变化也各自有一次轻微淡入。
     status.classList.remove('vrc-ule-status-animate');
@@ -380,50 +485,48 @@
    */
   function setExpanded(expanded) {
     toggleButton.setAttribute('aria-expanded', String(expanded));
-    bodyAnimation?.cancel();
-    bodyAnimation = null;
 
     if (reduceMotion.matches) {
+      bodyAnimation?.cancel();
+      bodyAnimation = null;
       body.hidden = !expanded;
       return;
     }
 
+    // 反向点击时先读取正在播放的实际画面，再取消旧动画；新动画便会从当前帧继续，
+    // 而不是瞬间跳回完全展开或完全收起的端点。
+    let currentFrame = null;
+    if (bodyAnimation) {
+      const computed = getComputedStyle(body);
+      currentFrame = {
+        height: `${body.getBoundingClientRect().height}px`,
+        paddingTop: computed.paddingTop,
+        paddingBottom: computed.paddingBottom,
+        opacity: computed.opacity,
+        transform: computed.transform === 'none' ? 'translateY(0)' : computed.transform,
+      };
+      bodyAnimation.cancel();
+      bodyAnimation = null;
+    }
+
     if (expanded) body.hidden = false;
     const expandedHeight = body.scrollHeight;
-    const currentHeight = body.offsetHeight;
-    const keyframes = expanded
-      ? [
-          {
-            height: '0px',
-            paddingTop: '0px',
-            paddingBottom: '0px',
-            opacity: 0,
-            transform: 'translateY(-5px)',
-          },
-          {
-            height: `${expandedHeight}px`,
-            paddingTop: '13px',
-            paddingBottom: '13px',
-            opacity: 1,
-            transform: 'translateY(0)',
-          },
-        ]
-      : [
-          {
-            height: `${currentHeight}px`,
-            paddingTop: '13px',
-            paddingBottom: '13px',
-            opacity: 1,
-            transform: 'translateY(0)',
-          },
-          {
-            height: '0px',
-            paddingTop: '0px',
-            paddingBottom: '0px',
-            opacity: 0,
-            transform: 'translateY(-5px)',
-          },
-        ];
+    const collapsedFrame = {
+      height: '0px',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      opacity: 0,
+      transform: 'translateY(-5px)',
+    };
+    const expandedFrame = {
+      height: `${expandedHeight}px`,
+      paddingTop: '13px',
+      paddingBottom: '13px',
+      opacity: 1,
+      transform: 'translateY(0)',
+    };
+    const destination = expanded ? expandedFrame : collapsedFrame;
+    const keyframes = [currentFrame ?? (expanded ? collapsedFrame : expandedFrame), destination];
 
     const animation = body.animate(keyframes, {
       duration: expanded ? 280 : 210,
@@ -477,7 +580,11 @@
   }
 
   function updateCountFor(values) {
-    setCount(listsEqual(values, loadedUrlList) ? `${values.length} 个` : `${values.length} 个 · 已编辑`);
+    setCount(
+      hasLoadedList && listsEqual(values, loadedUrlList)
+        ? `${values.length} 个`
+        : `${values.length} 个 · 已编辑`,
+    );
   }
 
   toggleButton.addEventListener('click', () => {
@@ -489,11 +596,11 @@
    * 仅在一个输入项已经结束后调用，避免用户输入 example.com.cn 的途中，
    * 因暂时匹配已有 example.com 而被提前删除。
    */
-  function dedupeInput({ analysis = analyzeInput(input.value) } = {}) {
+  function dedupeInput({ analysis = analyzeInput(input.value), announce = true } = {}) {
     if (analysis.duplicateCount > 0) {
       input.value = analysis.text;
       input.setSelectionRange(input.value.length, input.value.length);
-      setStatus(`已自动移除 ${analysis.duplicateCount} 个重复域名`);
+      if (announce) setStatus(`已自动移除 ${analysis.duplicateCount} 个重复域名`);
     }
 
     updateCountFor(analysis.values);
@@ -502,6 +609,8 @@
 
   // 编辑时即时更新数量徽标；输入尚不完整时只提示“待检查”，不打断输入。
   input.addEventListener('input', (event) => {
+    deferredDuplicateCount = 0;
+    inputTouchedSinceLoad = true;
     try {
       const analysis = analyzeInput(input.value);
 
@@ -523,9 +632,12 @@
   });
 
   // 用户离开文本框时，当前输入项已经完成，可以安全去重。
-  input.addEventListener('blur', () => {
+  input.addEventListener('blur', (event) => {
     try {
-      dedupeInput();
+      const analysis = analyzeInput(input.value);
+      const deferNotice = event.relatedTarget === sortButton || event.relatedTarget === submit;
+      dedupeInput({ analysis, announce: !deferNotice });
+      deferredDuplicateCount = deferNotice ? analysis.duplicateCount : 0;
     } catch {
       // 无效域名由排序或保存操作给出具体错误，不在失焦时打断用户。
     }
@@ -534,18 +646,28 @@
   sortButton.addEventListener('click', () => {
     try {
       const current = analyzeInput(input.value);
+      const removedDuplicates = deferredDuplicateCount + current.duplicateCount;
+      deferredDuplicateCount = 0;
       const sortedValues = sortDomains(current.values);
       const sortedText = sortedValues.join('\n');
 
       if (listsEqual(current.values, sortedValues) && input.value.trim() === sortedText) {
-        setStatus(`无需调整，${sortedValues.length} 个域名已经有序`);
+        setStatus(
+          removedDuplicates
+            ? `已移除 ${removedDuplicates} 个重复域名，其余域名已经有序`
+            : `无需调整，${sortedValues.length} 个域名已经有序`,
+        );
         return;
       }
 
       input.value = sortedText;
+      inputTouchedSinceLoad = true;
       input.setSelectionRange(input.value.length, input.value.length);
       updateCountFor(sortedValues);
-      setStatus(`已按域名层级排序 ${sortedValues.length} 个域名`);
+      setStatus(
+        `已按域名层级排序 ${sortedValues.length} 个域名` +
+          (removedDuplicates ? `，并移除 ${removedDuplicates} 个重复项` : ''),
+      );
     } catch (error) {
       setStatus(`无法排序：${error.message}`, true);
     }
@@ -557,7 +679,7 @@
    * VRChat 网站是 SPA，切换页面时可能不会刷新浏览器，因此每次读取都
    * 根据 location.pathname 重新解析世界 ID，而不是只在脚本启动时读取一次。
    */
-  async function loadCurrentList({ automatic = false } = {}) {
+  async function loadCurrentList({ automatic = false, restoreSavedDraft = true } = {}) {
     loadController?.abort();
     const controller = new AbortController();
     loadController = controller;
@@ -574,11 +696,25 @@
       // 若请求期间用户已切换到另一个世界，丢弃这个过期响应。
       if (controller.signal.aborted || worldId !== getWorldId()) return;
 
-      loadedUrlList = normalizeServerList(world.urlList);
+      loadedUrlList = getWorldList(world);
+      const writeCheck = inspectUncertainWrite(worldId, loadedUrlList);
+      hasLoadedList = true;
+      inputTouchedSinceLoad = false;
+      deferredDuplicateCount = 0;
       input.value = loadedUrlList.join('\n');
-      setCount(`${loadedUrlList.length} 个`);
       loadedWorldId = worldId;
-      setStatus(`已载入 ${loadedUrlList.length} 个域名`);
+      const restoredDraft = restoreSavedDraft && restoreDraft(worldId);
+      if (!restoredDraft) setCount(`${loadedUrlList.length} 个`);
+
+      if (writeCheck?.state === 'waiting') {
+        setStatus(`上次保存仍待确认，请约 ${writeCheck.seconds} 秒后重新载入；草稿已保留`, true);
+      } else if (writeCheck?.state === 'saved') {
+        setStatus(restoredDraft ? '已确认上次保存成功，并恢复之后的草稿' : '已确认上次保存成功');
+      } else if (writeCheck?.state === 'expired') {
+        setStatus(restoredDraft ? '等待期后未发现上次内容，已恢复草稿' : '等待期后未发现上次内容');
+      } else {
+        setStatus(restoredDraft ? '已载入服务器列表，并恢复未保存草稿' : `已载入 ${loadedUrlList.length} 个域名`);
+      }
     } catch (error) {
       // AbortError 是正常的页面切换或重复读取，不显示成故障。
       if (error.name === 'AbortError') return;
@@ -592,13 +728,103 @@
   }
 
   loadButton.addEventListener('click', () => {
+    const worldId = getWorldId();
+
+    // 写入结果未知时，“重新载入”只核对服务器状态，仍会恢复当前草稿。
+    if (worldId && uncertainWrites.has(worldId)) {
+      saveDraftForLoadedWorld();
+      loadCurrentList();
+      return;
+    }
+
     if (hasUnsavedChanges() && !confirm('重新载入会丢弃尚未保存的编辑，确定继续吗？')) return;
-    loadCurrentList();
+    if (worldId) draftsByWorld.delete(worldId);
+    loadCurrentList({ restoreSavedDraft: false });
   });
 
+  // 接受已经由服务器确认的列表。若用户在请求期间去了别的页面，只清理该世界草稿，
+  // 不触碰当前页面；若已经回到同一世界，则直接同步界面而不再发起多余请求。
+  function applyServerList(worldId, values, message) {
+    draftsByWorld.delete(worldId);
+    uncertainWrites.delete(worldId);
+    if (worldId !== getWorldId()) return;
+
+    loadedWorldId = worldId;
+    loadedUrlList = [...values];
+    hasLoadedList = true;
+    inputTouchedSinceLoad = false;
+    deferredDuplicateCount = 0;
+    input.value = values.join('\n');
+    setCount(`${values.length} 个`);
+    setStatus(message);
+  }
+
+  /**
+   * PUT 成功响应若没有 urlList，不能直接假定写入成功，而是再 GET 一次核对。
+   * PUT 超时或网络中断时，请求仍可能已抵达服务器，同样通过 GET 消除不确定性。
+   */
+  async function saveAndVerify(worldId, expected) {
+    let response = null;
+    let writeError = null;
+
+    try {
+      response = await api(`/api/1/worlds/${worldId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ urlList: expected }),
+      });
+    } catch (error) {
+      writeError = error;
+    }
+
+    if (Array.isArray(response?.urlList)) {
+      const responseList = normalizeServerList(response.urlList);
+      if (listsEqual(responseList, expected)) return responseList;
+    }
+
+    const writeUncertain = writeError?.writeUncertain === true;
+    const verificationDelays = writeUncertain ? [0, 1_500, 3_500, 7_000] : [0];
+    let verifiedList = null;
+    let verificationError = null;
+
+    if (writeUncertain && worldId === getWorldId()) {
+      setStatus('请求中断，正在确认服务器是否已经保存……');
+    }
+
+    // 不确定写入采用递增间隔复核，期间 pendingWrite 始终保持，不能发起第二次 PUT。
+    for (const delay of verificationDelays) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+
+      try {
+        verifiedList = getWorldList(
+          await api(`/api/1/worlds/${worldId}`, {
+            timeoutMs: writeUncertain ? 5_000 : REQUEST_TIMEOUT_MS,
+          }),
+        );
+        verificationError = null;
+        if (listsEqual(verifiedList, expected)) return verifiedList;
+      } catch (error) {
+        verificationError = error;
+      }
+    }
+
+    if (writeUncertain) {
+      const error = new Error('保存结果暂时无法确认，请点击“重新载入”核对服务器状态');
+      error.resultUncertain = true;
+      error.expected = [...expected];
+      error.releaseAfter = Date.now() + UNCERTAIN_WRITE_GUARD_MS;
+      throw error;
+    }
+    if (writeError) throw writeError;
+    if (verificationError) throw new Error(`无法确认保存结果：${verificationError.message}`);
+    throw new Error('服务器保存的白名单与提交内容不一致，请重新载入确认');
+  }
+
   submit.addEventListener('click', async () => {
+    if (isSubmitting || pendingWrite || uncertainWrites.has(getWorldId())) return;
+
     const sequence = ++submitSequence;
     const worldId = getWorldId();
+    let writeToken = null;
 
     try {
       if (!worldId) throw new Error('当前网址中没有世界 ID');
@@ -606,15 +832,25 @@
       // 本地列表与最后载入的列表完全一致时立即停止。
       // 这一判断位于所有 API 调用之前，因此不会发送 GET 或 PUT 请求。
       const draftInput = analyzeInput(input.value);
-      if (listsEqual(draftInput.values, loadedUrlList)) {
+      const removedDuplicates = deferredDuplicateCount + draftInput.duplicateCount;
+      deferredDuplicateCount = 0;
+      if (loadedWorldId === worldId && hasLoadedList && listsEqual(draftInput.values, loadedUrlList)) {
+        input.value = draftInput.text;
+        inputTouchedSinceLoad = false;
+        draftsByWorld.delete(worldId);
         updateCountFor(draftInput.values);
-        setStatus(`没有修改，已取消提交（${draftInput.values.length} 个域名）`);
+        setStatus(
+          removedDuplicates
+            ? `已移除 ${removedDuplicates} 个重复域名，服务器无需更新`
+            : `没有修改，已取消提交（${draftInput.values.length} 个域名）`,
+        );
         return;
       }
 
       // 保存严格保留当前排列顺序；只有点击“自动排序”才会调整顺序。
       const entered = draftInput.values;
       input.value = draftInput.text;
+      draftsByWorld.set(worldId, input.value);
 
       // 即便文本框已经自动载入，提交时仍重新 GET 一次。
       // 这样可以降低页面停留较久后覆盖掉其他修改的风险。
@@ -626,79 +862,122 @@
       // 提交期间切换了路由：旧请求可以自然结束，但绝不能再更新新页面的面板。
       if (!isActiveSubmit(sequence, worldId)) return;
 
-      const current = normalizeServerList(world.urlList);
+      let current = getWorldList(world);
       // 文本框就是最终列表；analyzeInput 已经完成规范化和去重。
       // 文本框为空时 next 也是空数组，即清空服务器上的 urlList。
       const next = entered;
 
-      // Set 查询是 O(1)，列表较长时比在 filter 中反复使用 includes 更稳妥。
-      const currentSet = new Set(current);
-      const nextSet = new Set(next);
-      const added = next.filter((item) => !currentSet.has(item));
-      const removed = current.filter((item) => !nextSet.has(item));
       if (listsEqual(current, next)) {
-        setStatus(`没有变化，当前仍为 ${current.length} 个域名`);
+        applyServerList(
+          worldId,
+          current,
+          `服务器已是目标内容，无需提交（${current.length} 个域名）` +
+            (removedDuplicates ? `；已移除 ${removedDuplicates} 个重复项` : ''),
+        );
         return;
       }
 
       // 如果从“载入”到“提交”期间服务器列表被其他页面修改，
       // 确认框会明确提醒，但仍允许用户选择以当前文本框覆盖。
-      const serverChanged = !listsEqual(loadedUrlList, current);
+      let warning = hasLoadedList && !listsEqual(loadedUrlList, current)
+        ? '⚠ 服务器列表在载入后已发生变化，本次保存会覆盖它。'
+        : null;
+      loadedWorldId = worldId;
+      loadedUrlList = [...current];
+      hasLoadedList = true;
+      updateCountFor(next);
 
-      const summary = [
-        `世界：${world.name} (${worldId})`,
-        `当前 ${current.length} 个 → 修改后 ${next.length} 个`,
-        `新增 ${added.length} 个，删除 ${removed.length} 个`,
-        ...(added.length === 0 && removed.length === 0 ? ['仅调整域名排序'] : []),
-        ...(serverChanged ? ['', '⚠ 服务器列表在载入后已发生变化，本次保存会覆盖它。'] : []),
-        '',
-        '确定立即提交吗？',
-      ].join('\n');
-      if (!confirm(summary)) {
-        setStatus('已取消，没有修改');
-        return;
+      while (true) {
+        // Set 查询是 O(1)，列表较长时比反复使用 includes 更稳妥。
+        const currentSet = new Set(current);
+        const nextSet = new Set(next);
+        const added = next.filter((item) => !currentSet.has(item));
+        const removed = current.filter((item) => !nextSet.has(item));
+        const summary = [
+          `世界：${world.name ? `${world.name} (${worldId})` : worldId}`,
+          `当前 ${current.length} 个 → 修改后 ${next.length} 个`,
+          `新增 ${added.length} 个，删除 ${removed.length} 个`,
+          ...(removedDuplicates ? [`自动移除 ${removedDuplicates} 个重复域名`] : []),
+          ...(added.length === 0 && removed.length === 0 ? ['仅调整域名排序'] : []),
+          ...(warning ? ['', warning] : []),
+          '',
+          '确定立即提交吗？',
+        ].join('\n');
+
+        if (!confirm(summary)) {
+          setStatus(
+            removedDuplicates
+              ? `已取消提交；已在本地移除 ${removedDuplicates} 个重复域名`
+              : '已取消，没有修改',
+          );
+          return;
+        }
+
+        if (!isActiveSubmit(sequence, worldId)) return;
+        setStatus('正在进行保存前最终检查……');
+        const latestWorld = await api(`/api/1/worlds/${worldId}`);
+        if (!isActiveSubmit(sequence, worldId)) return;
+        const latest = getWorldList(latestWorld);
+        if (listsEqual(latest, current)) break;
+
+        current = latest;
+        loadedUrlList = [...current];
+        updateCountFor(next);
+        if (listsEqual(current, next)) {
+          applyServerList(
+            worldId,
+            current,
+            `确认期间服务器已变为目标内容，无需提交（${current.length} 个域名）`,
+          );
+          return;
+        }
+        warning = '⚠ 服务器列表在确认期间再次发生变化，请核对后重新确认。';
       }
-
-      // confirm 弹窗打开时也可能发生脚本导航，发送 PUT 前再检查一次。
-      if (!isActiveSubmit(sequence, worldId)) return;
-
-      const payload = {};
-      for (const key of EDITABLE_FIELDS) {
-        if (Object.prototype.hasOwnProperty.call(world, key)) payload[key] = world[key];
-      }
-      payload.urlList = next;
 
       // HAR 中确认的更新方式：PUT /api/1/worlds/{worldId}
+      // 仅发送 urlList，避免把预读取到的其他世界字段一并覆盖回服务器。
+      writeToken = { worldId };
+      pendingWrite = writeToken;
+      updateControls();
       setStatus('正在提交……');
-      const updated = await api(`/api/1/worlds/${worldId}`, {
-        method: 'PUT',
-        body: JSON.stringify(payload),
-      });
-
-      // PUT 期间若用户离开后又返回同一世界，之前触发的 GET 可能读到了
-      // PUT 完成前的旧列表。此时重新读取一次，确保面板与服务器一致。
-      if (!isActiveSubmit(sequence, worldId)) {
-        if (worldId === getWorldId()) loadCurrentList({ automatic: true });
-        return;
+      let savedList;
+      try {
+        savedList = await saveAndVerify(worldId, next);
+      } finally {
+        if (pendingWrite === writeToken) {
+          pendingWrite = null;
+          updateControls();
+        }
       }
 
-      const savedList = normalizeServerList(Array.isArray(updated?.urlList) ? updated.urlList : next);
-      loadedUrlList = [...savedList];
-      input.value = savedList.join('\n');
-      setCount(`${savedList.length} 个`);
-      setStatus(`修改成功：服务器现有 ${savedList.length} 个域名`);
+      applyServerList(
+        worldId,
+        savedList,
+        `修改成功：服务器现有 ${savedList.length} 个域名` +
+          (removedDuplicates ? `；已移除 ${removedDuplicates} 个重复项` : ''),
+      );
     } catch (error) {
-      if (isActiveSubmit(sequence, worldId)) {
+      if (error.resultUncertain) {
+        uncertainWrites.set(worldId, {
+          expected: error.expected,
+          releaseAfter: error.releaseAfter,
+        });
+        if (worldId === getWorldId()) {
+          setStatus(`${error.message}；草稿已保留，确认前不能再次保存`, true);
+        }
+      } else if (isActiveSubmit(sequence, worldId)) {
         setStatus(`提交失败：${error.message}`, true);
       } else if (worldId === getWorldId()) {
-        // 请求失败时服务器是否已处理 PUT 未必可知，返回原世界后同样重新确认。
-        loadCurrentList({ automatic: true });
+        // 返回原世界时重新建立服务器基线，并恢复之前按世界保存的草稿。
+        saveDraftForLoadedWorld();
+        await loadCurrentList({ automatic: true });
       }
     } finally {
+      if (pendingWrite === writeToken) pendingWrite = null;
       if (sequence === submitSequence) {
         isSubmitting = false;
-        updateControls();
       }
+      updateControls();
     }
   });
 
@@ -710,10 +989,17 @@
   function syncPanelWithCurrentPage() {
     const worldId = getWorldId();
 
+    // 离开当前世界前按世界保存草稿；回到该世界时会在最新服务器列表之上恢复。
+    if (worldId !== loadedWorldId) saveDraftForLoadedWorld();
+
     if (!worldId) {
       panel.hidden = true;
       loadedWorldId = null;
       loadedUrlList = [];
+      hasLoadedList = false;
+      input.value = '';
+      inputTouchedSinceLoad = false;
+      deferredDuplicateCount = 0;
       setCount('读取中');
       submitSequence++;
       isSubmitting = false;
@@ -729,18 +1015,28 @@
       // 切换世界时让旧世界尚未完成的提交停止操作当前界面。
       submitSequence++;
       isSubmitting = false;
-      updateControls();
+      loadController?.abort();
+      loadController = null;
 
       // 立即清除上一个世界的数据。即便新世界读取失败，也不会让用户误把
       // 上一个世界的白名单提交到当前世界。
       input.value = '';
       loadedUrlList = [];
+      hasLoadedList = false;
+      inputTouchedSinceLoad = false;
+      deferredDuplicateCount = 0;
       setStatus('正在切换世界……');
 
-      // 先标记，避免同一轮路由事件重复发起同一个 GET。
-      // 若自动读取失败，仍可点击“载入当前列表”手动重试。
+      // 先标记，避免同一轮路由事件重复发起同一个 GET。若该世界仍有 PUT
+      // 在执行，则等待其完成后直接同步，避免提前读取并显示旧列表。
       loadedWorldId = worldId;
-      loadCurrentList({ automatic: true });
+      restoreDraft(worldId);
+      if (pendingWrite?.worldId === worldId) {
+        setStatus('正在等待上次保存完成……');
+        updateControls();
+      } else {
+        loadCurrentList({ automatic: true });
+      }
     }
   }
 
